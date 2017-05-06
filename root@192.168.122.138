@@ -1,0 +1,194 @@
+diff --git a/oci/container.go b/oci/container.go
+index 9ac624e..3f9bc27 100644
+--- a/oci/container.go
++++ b/oci/container.go
+@@ -1,11 +1,15 @@
+ package oci
+ 
+ import (
++	"encoding/json"
+ 	"fmt"
++	"os"
++	"path/filepath"
+ 	"sync"
+ 	"time"
+ 
+ 	"github.com/containernetworking/cni/pkg/ns"
++	"github.com/docker/docker/pkg/ioutils"
+ 	specs "github.com/opencontainers/runtime-spec/specs-go"
+ 	"k8s.io/apimachinery/pkg/fields"
+ 	pb "k8s.io/kubernetes/pkg/kubelet/api/v1alpha1/runtime"
+@@ -27,6 +31,7 @@ type Container struct {
+ 	state       *ContainerState
+ 	metadata    *pb.ContainerMetadata
+ 	opLock      sync.Mutex
++	stateDir    string
+ }
+ 
+ // ContainerState represents the status of a container.
+@@ -39,7 +44,7 @@ type ContainerState struct {
+ }
+ 
+ // NewContainer creates a container object.
+-func NewContainer(id string, name string, bundlePath string, logPath string, netns ns.NetNS, labels map[string]string, annotations map[string]string, image *pb.ImageSpec, metadata *pb.ContainerMetadata, sandbox string, terminal bool, privileged bool) (*Container, error) {
++func NewContainer(id string, name string, bundlePath string, logPath string, netns ns.NetNS, labels map[string]string, annotations map[string]string, image *pb.ImageSpec, metadata *pb.ContainerMetadata, sandbox string, terminal bool, privileged bool, stateDir string) (*Container, error) {
+ 	c := &Container{
+ 		id:          id,
+ 		name:        name,
+@@ -53,10 +58,36 @@ func NewContainer(id string, name string, bundlePath string, logPath string, net
+ 		metadata:    metadata,
+ 		annotations: annotations,
+ 		image:       image,
++		stateDir:    stateDir,
+ 	}
+ 	return c, nil
+ }
+ 
++func (c *Container) toDisk() error {
++	pth := filepath.Join(c.stateDir, "state")
++	jsonSource, err := ioutils.NewAtomicFileWriter(pth, 0644)
++	if err != nil {
++		return err
++	}
++	defer jsonSource.Close()
++	enc := json.NewEncoder(jsonSource)
++	return enc.Encode(c)
++}
++
++func (c *Container) FromDisk() error {
++	pth := filepath.Join(c.stateDir, "state")
++
++	jsonSource, err := os.Open(pth)
++	if err != nil {
++		return err
++	}
++	defer jsonSource.Close()
++
++	dec := json.NewDecoder(jsonSource)
++
++	return dec.Decode(c)
++}
++
+ // Name returns the name of the container.
+ func (c *Container) Name() string {
+ 	return c.name
+diff --git a/oci/oci.go b/oci/oci.go
+index 1f92710..b3b2db6 100644
+--- a/oci/oci.go
++++ b/oci/oci.go
+@@ -474,6 +474,12 @@ func (r *Runtime) DeleteContainer(c *Container) error {
+ func (r *Runtime) UpdateStatus(c *Container) error {
+ 	c.opLock.Lock()
+ 	defer c.opLock.Unlock()
++	// TODO: provide a default state like createdAt and such!
++	// idally, this state should be stored on disk for restore after reboot
++	// for instance
++	c.state = &ContainerState{
++		Created: time.Time{},
++	}
+ 	out, err := exec.Command(r.Path(c), "state", c.name).CombinedOutput()
+ 	if err != nil {
+ 		return fmt.Errorf("error getting container state for %s: %s: %q", c.name, err, out)
+@@ -504,6 +510,8 @@ func (r *Runtime) UpdateStatus(c *Container) error {
+ 		}
+ 	}
+ 
++	c.toDisk()
++
+ 	return nil
+ }
+ 
+diff --git a/server/container_create.go b/server/container_create.go
+index 38fc3c6..8e999cc 100644
+--- a/server/container_create.go
++++ b/server/container_create.go
+@@ -594,7 +594,7 @@ func (s *Server) createSandboxContainer(ctx context.Context, containerID string,
+ 		return nil, err
+ 	}
+ 
+-	container, err := oci.NewContainer(containerID, containerName, containerInfo.RunDir, logPath, sb.netNs(), labels, annotations, imageSpec, metadata, sb.id, containerConfig.Tty, sb.privileged)
++	container, err := oci.NewContainer(containerID, containerName, containerInfo.RunDir, logPath, sb.netNs(), labels, annotations, imageSpec, metadata, sb.id, containerConfig.Tty, sb.privileged, containerInfo.Dir)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+diff --git a/server/container_status.go b/server/container_status.go
+index e1a0bd2..26fe104 100644
+--- a/server/container_status.go
++++ b/server/container_status.go
+@@ -2,6 +2,7 @@ package server
+ 
+ import (
+ 	"encoding/json"
++	"time"
+ 
+ 	"github.com/Sirupsen/logrus"
+ 	"github.com/kubernetes-incubator/cri-o/oci"
+@@ -71,6 +72,9 @@ func (s *Server) ContainerStatus(ctx context.Context, req *pb.ContainerStatusReq
+ 			finished := cState.Finished.UnixNano()
+ 			resp.Status.FinishedAt = finished
+ 			resp.Status.ExitCode = cState.ExitCode
++		default:
++			resp.Status.CreatedAt = time.Time{}.UnixNano()
++			resp.Status.StartedAt = time.Time{}.UnixNano()
+ 		}
+ 	}
+ 
+diff --git a/server/sandbox_run.go b/server/sandbox_run.go
+index 4c31a24..29a77fd 100644
+--- a/server/sandbox_run.go
++++ b/server/sandbox_run.go
+@@ -416,7 +416,7 @@ func (s *Server) RunPodSandbox(ctx context.Context, req *pb.RunPodSandboxRequest
+ 		return nil, fmt.Errorf("failed to write runtime configuration for pod sandbox %s(%s): %v", sb.name, id, err)
+ 	}
+ 
+-	container, err := oci.NewContainer(id, containerName, podContainer.RunDir, logPath, sb.netNs(), labels, annotations, nil, nil, id, false, sb.privileged)
++	container, err := oci.NewContainer(id, containerName, podContainer.RunDir, logPath, sb.netNs(), labels, annotations, nil, nil, id, false, sb.privileged, podContainer.Dir)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+diff --git a/server/server.go b/server/server.go
+index 2fa2c8e..f61bdee 100644
+--- a/server/server.go
++++ b/server/server.go
+@@ -133,12 +133,18 @@ func (s *Server) loadContainer(id string) error {
+ 		return err
+ 	}
+ 
+-	ctr, err := oci.NewContainer(id, name, containerPath, m.Annotations["ocid/log_path"], sb.netNs(), labels, annotations, img, &metadata, sb.id, tty, sb.privileged)
++	cDir, err := s.store.GetContainerDirectory(id)
+ 	if err != nil {
+ 		return err
+ 	}
++
++	ctr, err := oci.NewContainer(id, name, containerPath, m.Annotations["ocid/log_path"], sb.netNs(), labels, annotations, img, &metadata, sb.id, tty, sb.privileged, cDir)
++	if err != nil {
++		return err
++	}
++	ctr.FromDisk()
+ 	if err = s.runtime.UpdateStatus(ctr); err != nil {
+-		return fmt.Errorf("error updating status for container %s: %v", ctr.ID(), err)
++		logrus.Debugf("error updating status for container %s: %v", ctr.ID(), err)
+ 	}
+ 	s.addContainer(ctr)
+ 	return s.ctrIDIndex.Add(id)
+@@ -253,12 +259,18 @@ func (s *Server) loadSandbox(id string) error {
+ 		}
+ 	}()
+ 
+-	scontainer, err := oci.NewContainer(m.Annotations["ocid/container_id"], cname, sandboxPath, m.Annotations["ocid/log_path"], sb.netNs(), labels, annotations, nil, nil, id, false, privileged)
++	cDir, err := s.store.GetContainerDirectory(id)
++	if err != nil {
++		return err
++	}
++
++	scontainer, err := oci.NewContainer(m.Annotations["ocid/container_id"], cname, sandboxPath, m.Annotations["ocid/log_path"], sb.netNs(), labels, annotations, nil, nil, id, false, privileged, cDir)
+ 	if err != nil {
+ 		return err
+ 	}
++	scontainer.FromDisk()
+ 	if err = s.runtime.UpdateStatus(scontainer); err != nil {
+-		return fmt.Errorf("error updating status for pod sandbox infra container %s: %v", scontainer.ID(), err)
++		logrus.Debugf("error updating status for pod sandbox infra container %s: %v", scontainer.ID(), err)
+ 	}
+ 	if err = label.ReserveLabel(processLabel); err != nil {
+ 		return err
