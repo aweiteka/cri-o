@@ -95,7 +95,7 @@ a {
   background-position: center 1em;
 
   @include large {
-    padding: 7rem 6rem;
+    padding: 5rem 6rem;
   }
 
   @include medium {
@@ -125,7 +125,7 @@ a {
 }
 
 .project-tagline {
-  margin-bottom: 0rem;
+  margin-bottom: -1rem;
   font-weight: normal;
   opacity: 0.7;
   margin-top: 4rem;
