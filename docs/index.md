@@ -35,3 +35,8 @@ TBA
 1. Support for log management, networking integration using CNI, pluggable image/storage management
 1. Support for exec/attach
 1. Target fully automated kubernetes testing without failures
+
+<h2>
+<a class="twitter-timeline"  href="https://twitter.com/hashtag/%22cri-o%22" data-widget-id="862337196434632704">#"cri-o" Tweets</a>
+</h2>
+<script>!function(d,s,id){var js,fjs=d.getElementsByTagName(s)[0],p=/^http:/.test(d.location)?'http':'https';if(!d.getElementById(id)){js=d.createElement(s);js.id=id;js.src=p+"://platform.twitter.com/widgets.js";fjs.parentNode.insertBefore(js,fjs);}}(document,"script","twitter-wjs");</script>
